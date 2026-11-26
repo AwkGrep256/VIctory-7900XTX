@@ -1370,6 +1370,83 @@ fn stored_levels(r: &Resource, first: u32) -> Option<(u32, std::sync::Arc<Vec<u8
 #[cfg(windows)]
 pub(crate) static HELD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// The largest side, in texels, of a sampled placed texture on the host.
+#[cfg(windows)]
+fn texture_max_dim() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_TEXTURE_MAX_DIM").ok()?;
+        match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n @ 4..=16384) => {
+                tracing::info!(max_dim = n, "limiting the host size of sampled placed BC textures");
+                Some(n)
+            }
+            _ => {
+                tracing::warn!(value, "VICTORY_TEXTURE_MAX_DIM expects 0 or a size from 4 to 16384");
+                None
+            }
+        }
+    })
+}
+
+/// Whether textures that look like flat screen images keep their full size
+/// under `VICTORY_TEXTURE_MAX_DIM`. On by default;
+/// `VICTORY_TEXTURE_MAX_DIM_KEEP_UI=0` caps them too. Single-level textures
+/// are never capped either way.
+#[cfg(windows)]
+fn keep_ui() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_MAX_DIM_KEEP_UI").is_none_or(|v| v != "0"))
+}
+
+/// Flat screen images (loading screens, menus): a side that is not a power
+/// of two (1920x1080...), or a short mip chain (1-3 levels, or 3+ fewer than
+/// a full chain down to the smaller side). World textures are powers of two
+/// with full chains (BC chains may stop at 4x4, hence the smaller side).
+// ponytail: shape-only guess; the debug lines below show what slips through.
+fn looks_like_ui(desc: &ResourceDesc) -> bool {
+    let (w, h) = (desc.width, u64::from(desc.height));
+    let full = u64::from(64 - w.min(h).max(1).leading_zeros());
+    !w.is_power_of_two() || !h.is_power_of_two() || desc.mip_levels <= 3 || u64::from(desc.mip_levels) + 2 < full
+}
+
+#[cfg(windows)]
+fn capped_texture(desc: &ResourceDesc, max_dim: u64) -> Option<ResourceDesc> {
+    const TEXTURE_2D: u32 = 3;
+    if desc.dimension != TEXTURE_2D
+        || desc.flags & 0xf != 0
+        || desc.depth_or_array_size != 1
+        || desc.sample_count != 1
+        || desc.mip_levels <= 1
+        || !element(desc.format).is_some_and(|(_, block)| block == 4)
+    {
+        return None;
+    }
+    let mut host = *desc;
+    while host.width.max(u64::from(host.height)) > max_dim && host.mip_levels > 1 {
+        host.width = (host.width / 2).max(1);
+        host.height = (host.height / 2).max(1);
+        host.mip_levels -= 1;
+    }
+    // D3D12 requires a BC resource's top level to be block-aligned.
+    (host.mip_levels < desc.mip_levels
+        && host.width.max(u64::from(host.height)) <= max_dim
+        && host.width.is_multiple_of(4)
+        && host.height.is_multiple_of(4))
+    .then_some(host)
+}
+
+#[cfg(windows)]
+fn texture_cap_base(desc: &ResourceDesc) -> u32 {
+    let Some(limit) = texture_max_dim() else { return 0 };
+    if keep_ui() && looks_like_ui(desc) {
+        return 0;
+    }
+    capped_texture(desc, limit)
+        .map_or(0, |capped| u32::from(desc.mip_levels - capped.mip_levels))
+}
+
 /// A view of the placed texture `this` that starts at level `first` is made
 /// or brought up to date: a host copy without that level is replaced by one
 /// with it (made and filled at the next use; the slots that show the old
@@ -1392,7 +1469,7 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    if host.base <= base_level(&r.desc, first).max(texture_cap_base(&r.desc)) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1583,6 +1660,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // view of it starts below level 0. Every other texture, and this
         // one if the card will not have it so, is made as before.
         const TEXTURE_2D: u32 = 3;
+        let cap_base = if r.host.placed.load(Relaxed) && clear.is_null() {
+            texture_cap_base(&r.desc)
+        } else {
+            0
+        };
         let mut tiled = None;
         let mut texture = None;
         let shape_fits = fills(&r.desc)
@@ -1590,7 +1672,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if cap_base == 0 && shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1615,17 +1697,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
-        let mut base = 0;
+        let mut base = cap_base;
         let mut prefill = None;
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
             if first != u32::MAX {
-                base = base_level(&r.desc, first);
+                base = base_level(&r.desc, first).max(cap_base);
             }
             // The store has its larger levels: made whole at once.
             if base > 0
+                && cap_base == 0
                 && tiled.is_none()
                 && let Some(found) = stored_levels(r, first)
             {
