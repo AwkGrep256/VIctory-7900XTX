@@ -31,6 +31,7 @@ pub mod frame_rate;
 mod patch;
 pub mod prepare;
 pub(crate) mod publish;
+pub mod resolution;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
