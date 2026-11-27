@@ -9550,6 +9550,8 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        #[cfg(feature = "diagnostics")]
+        let hudless = crate::framegen::hudless::take(overlay.is_none().then_some(texture));
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {
@@ -9804,7 +9806,7 @@ impl Host {
             // motion in this list, before the present inserts its frames.
             #[cfg(feature = "diagnostics")]
             let generated = match &mut p.framegen {
-                Some(fg) => fg.prepare(&p.swap_chain, &self.device, copy, [width, height], frame),
+                Some(fg) => fg.prepare(&p.swap_chain, &self.device, copy, [width, height], frame, hudless),
                 None => false,
             };
             #[cfg(not(feature = "diagnostics"))]
@@ -9838,10 +9840,12 @@ impl Host {
             let status = p.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0));
             #[cfg(feature = "diagnostics")]
             if generated && let Some(fg) = &mut p.framegen {
-                if status.is_ok() {
+                if status.is_ok()
+                    && (status == windows::Win32::Foundation::S_OK || !crate::framegen::hudless::enabled())
+                {
                     fg.presented(&p.swap_chain, frame);
                 } else {
-                    tracing::warn!(?status, frame, "FidelityFX frame generation: present failed; off");
+                    tracing::warn!(?status, frame, "FidelityFX frame generation: present did not complete normally; off");
                     fg.disable(&p.swap_chain);
                 }
             }

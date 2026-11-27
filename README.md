@@ -170,6 +170,17 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   `VICTORY_FIDELITYFX_FRAMEGEN=1` adds AMD frame generation with the built-in
   Frame Generation 3.x providers of `amd_fidelityfx_framegeneration_dx12.dll`
   from the same folder (RGBA8 swap chains only).
+  `VICTORY_FRAMEGEN_HUDLESS=1` lets Series X FG3 use a copy of the scene
+  taken before the HUD blend, when the matched draw writes the displayed
+  texture. Use the normal HUD for this test.
+  Set `VICTORY_FRAMEGEN_ONLY_GENERATED=1` to inspect generated frames on screen.
+  Compare the same camera movement with frame generation off. Use a screen
+  recording for this comparison because VIctory's frame capture saves the game
+  image before AMD inserts frames.
+  With FG3, `VICTORY_AB=8,VICTORY_FRAMEGEN_HIDE_HUD` hides the candidate HUD
+  blend every other eight-second interval. Use the same camera turn in both
+  intervals to check whether hiding that draw removes the compass while
+  leaving the scene intact.
 
 ## Credits
 

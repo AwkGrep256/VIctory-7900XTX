@@ -3842,6 +3842,14 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        #[cfg(feature = "diagnostics")]
+        if vertices == 3
+            && instances == 1
+            && self.targets.len() == 1
+            && crate::framegen::hide_hud_for_probe(self.pipeline as This)
+        {
+            return;
+        }
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -3859,6 +3867,9 @@ impl State {
             #[cfg(feature = "diagnostics")]
             if count == 3 && instances == 1 {
                 self.record_framegen_camera(list);
+                if let [target] = self.targets.as_slice() {
+                    crate::framegen::hudless::record(list, self.pipeline as This, *target as This);
+                }
             }
             // SAFETY: an open list with everything set.
             unsafe {
