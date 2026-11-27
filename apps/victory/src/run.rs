@@ -4,6 +4,10 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+#[cfg(windows)]
+#[path = "fsr_4k.rs"]
+mod fsr_4k;
+
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -53,11 +57,15 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    // Before the import registry is first used: it holds the module only
-    // when the host's FidelityFX serves.
-    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
+    let fsr = fsr_4k::FsrPreset::requested()?;
+    if fsr.is_none()
+        && let Some(dir) = cfg.fidelityfx_dir.as_deref()
+        && let Err(error) = victory_hle::modules::fidelityfx::use_host_dir(dir)
+    {
+        tracing::warn!(folder = %dir.display(), %error, "FidelityFX: using the title's upscaler");
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
@@ -66,7 +74,24 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = victory_loader::load(&prepared, &images)?;
+    let image = if let Some(preset) = fsr {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
+        fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
+        let dir = cfg.fidelityfx_dir.as_deref().context(
+            "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+        )?;
+        // Select the provider before the first lookup builds the import registry.
+        victory_hle::modules::fidelityfx::use_host_dir(dir)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
+        // SAFETY: Windows supports setting the environment across threads.
+        // No title code has run or queried DXGI yet.
+        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
+        let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
+        victory_loader::load(&prepared, &cache)?
+    } else {
+        victory_loader::load(&prepared, &images)?
+    };
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
@@ -222,7 +247,7 @@ pub fn run(
     // The diagnostics integration owns the paired picker and FFX scale
     // patches when serving the host SDK.
     #[cfg(windows)]
-    if execute {
+    if execute && fsr.is_none() {
         let size = image.info().size_of_image as usize;
         let host_fidelityfx_patches = cfg!(feature = "diagnostics")
             && victory_hle::modules::fidelityfx::serving();
@@ -240,7 +265,7 @@ pub fn run(
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
-    diagnostics(&image, &cfg)?;
+    diagnostics(&image, &cfg, fsr.is_none())?;
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -265,9 +290,13 @@ pub fn run(
 /// The debugging aids (README): title code patches, scheduled stack dumps,
 /// watched values and memory saved on a crash. An error stops the launch.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) -> Result<()> {
+fn diagnostics(
+    image: &victory_loader::LoadedImage,
+    cfg: &victory_core::Config,
+    patch_fidelityfx: bool,
+) -> Result<()> {
     // First, before any thread started below can read or write the image.
-    if victory_hle::modules::fidelityfx::serving() {
+    if patch_fidelityfx && victory_hle::modules::fidelityfx::serving() {
         crate::title_patch::apply(image)?;
     }
     victory_loader::dump_stacks_on_schedule();
